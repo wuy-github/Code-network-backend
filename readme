@@ -1,0 +1,3 @@
+Flask: Dùng để tạo web server.
+getmac: Dùng để lấy địa chỉ MAC (cần cho phương án chạy file script).
+requests: Dùng để gửi dữ liệu từ client lên server (cần cho phương án chạy file script).
