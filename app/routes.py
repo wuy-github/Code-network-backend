@@ -1,39 +1,151 @@
 # file: app/routes.py
-from flask import Blueprint, jsonify, request
-import mysql.connector
+# bao mat
+from flask import Blueprint, jsonify, request, current_app
+from functools import wraps
+import jwt
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# Extensions & Helpers
+from flask_mail import Message
+from app import mail, socketio
+import datetime
+from time import sleep
+
+# Local
 from .config import DB_CONFIG
 from .utils import get_mac_from_ip, scan_network
+import mysql.connector
 
 api = Blueprint('api', __name__)
-session_active = False
 
-@api.route('/')
-def home():
-    return "<h1>API Server cho hệ thống điểm danh đang hoạt động!</h1>"
+# == CÁC BIẾN TOÀN CỤC ĐỂ QUẢN LÝ TRẠNG THÁI ==
+session_active = False
+# Dùng một biến cờ để đảm bảo tác vụ nền chỉ được khởi động MỘT LẦN
+background_task_started = False 
+
+# bao mat
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            # Lấy token từ header, dạng "Bearer <token>"
+            token = request.headers['Authorization'].split(" ")[1]
+
+        if not token:
+            return jsonify({'message': 'Thiếu token!'}), 401
+
+        try:
+            # Giải mã token
+            data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=["HS256"])
+            # Bạn có thể lấy thông tin người dùng từ data['user_id'] nếu cần
+        except:
+            return jsonify({'message': 'Token không hợp lệ hoặc đã hết hạn!'}), 401
+
+        return f(*args, **kwargs)
+
+    return decorated
+
+# ===================================================================
+# == PHẦN LOGIC MỚI CỦA WEBSOCKET - TRÁI TIM CỦA HỆ THỐNG LIVE ==
+# ===================================================================
+
+def attendance_background_task():
+    """
+    Đây là hàm sẽ chạy liên tục trong một luồng riêng khi phiên điểm danh BẮT ĐẦU.
+    Nó thay thế hoàn toàn cho route /api/attendance/live.
+    """
+    print("LOG: Bắt đầu tác vụ quét mạng chạy nền...")
+    while session_active:
+        try:
+            # 1. Quét mạng để lấy các MAC đang hoạt động
+            active_mac_set = scan_network()
+            
+            # 2. Lấy danh sách sinh viên từ DB và kiểm tra trạng thái
+            # (Logic này được copy từ hàm live_attendance cũ của bạn)
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT student_id, full_name, mac_address FROM Students")
+            students = cursor.fetchall()
+            
+            attendance_status_list = []
+            for student in students:
+                status = 'Vắng mặt'
+                if student['mac_address'] and student['mac_address'].upper() in active_mac_set:
+                    status = 'Có mặt'
+                student['status'] = status
+                attendance_status_list.append(student)
+            
+            # 3. PHÁT SỰ KIỆN: Gửi dữ liệu điểm danh tới TẤT CẢ client
+            # Tên sự kiện là 'update_attendance', kèm theo dữ liệu là danh sách điểm danh.
+            socketio.emit('update_attendance', attendance_status_list)
+
+        except Exception as e:
+            print(f"ERROR: Lỗi trong tác vụ nền: {e}")
+        finally:
+            # Đóng kết nối DB sau mỗi lần quét
+            if 'conn' in locals() and conn.is_connected():
+                conn.close()
+        
+        # 4. Chờ 5 giây trước khi lặp lại
+        # Dùng socketio.sleep() thay vì time.sleep() để không block server
+        socketio.sleep(5)
+    
+    print("LOG: Đã dừng tác vụ quét mạng chạy nền.")
+
+@socketio.on('connect')
+def handle_connect():
+    """
+    Hàm này được tự động gọi mỗi khi có một trình duyệt mới kết nối tới WebSocket.
+    """
+    print('LOG: Một client vừa kết nối tới WebSocket.')
+
+
+# ===================================================================
+# == CẬP NHẬT CÁC ROUTE CŨ ĐỂ ĐIỀU KHIỂN LOGIC WEBSOCKET ==
+# ===================================================================
 
 @api.route('/api/session/start', methods=['POST'])
+@token_required
 def start_session():
-    """Bắt đầu một phiên điểm danh."""
-    global session_active
-    session_active = True
-    return jsonify({"message": "Đã bắt đầu phiên điểm danh."})
+    """Bắt đầu một phiên điểm danh VÀ khởi động tác vụ chạy nền."""
+    global session_active, background_task_started
+    
+    if not session_active:
+        session_active = True
+        # Chỉ khởi động tác vụ nếu nó chưa từng được chạy
+        if not background_task_started:
+            # Dùng hàm của socketio để chạy hàm của chúng ta trong một luồng riêng
+            socketio.start_background_task(target=attendance_background_task)
+            background_task_started = True # Đánh dấu là tác vụ đã được kích hoạt
+        return jsonify({"message": "Đã bắt đầu phiên điểm danh và quét mạng."})
+    else:
+        return jsonify({"message": "Phiên đã hoạt động từ trước."})
+
 
 @api.route('/api/session/stop', methods=['POST'])
+@token_required
 def stop_session():
-    """Kết thúc phiên, quét lần cuối và trả về báo cáo."""
-    global session_active
+    """Kết thúc phiên, dừng tác vụ nền, quét lần cuối và trả về báo cáo."""
+    global session_active, background_task_started
     if not session_active:
         return jsonify({"error": "Không có phiên nào đang diễn ra."}), 400
 
+   
+    session_active = False
+    background_task_started = False
+
+    socketio.emit('session_stopped')
+    
+    # 3. Giữ nguyên logic tạo báo cáo cuối kỳ của bạn
     conn = None
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
-        # Lấy TẤT CẢ sinh viên để đưa vào báo cáo
         cursor.execute("SELECT student_id, full_name, mac_address FROM Students")
         students = cursor.fetchall()
         
-        active_mac_set = scan_network()
+        active_mac_set = scan_network() # Quét lần cuối
         final_report = []
         for student in students:
             status = 'Vắng mặt'
@@ -42,8 +154,46 @@ def stop_session():
             student['status'] = status
             final_report.append(student)
             
-        session_active = False
-        # TRẢ VỀ CẢ MESSAGE VÀ REPORT
+        try:
+            # 1. Chuẩn bị nội dung email từ `final_report`
+            present_students = [s for s in final_report if s['status'] == 'Có mặt']
+            absent_students = [s for s in final_report if s['status'] == 'Vắng mặt']
+
+            # Dùng HTML để định dạng email cho đẹp mắt
+            html_body = f"""
+            <h1>Báo cáo Điểm danh</h1>
+            <p>Phiên điểm danh đã kết thúc vào lúc {datetime.datetime.now().strftime('%H:%M:%S %d-%m-%Y')}.</p>
+            
+            <h2>Sinh viên có mặt ({len(present_students)})</h2>
+            <ul>
+                {''.join([f'<li>{s["student_id"]} - {s["full_name"]}</li>' for s in present_students])}
+            </ul>
+
+            <h2>Sinh viên vắng mặt ({len(absent_students)})</h2>
+            <ul>
+                {''.join([f'<li>{s["student_id"]} - {s["full_name"]}</li>' for s in absent_students])}
+            </ul>
+            """
+
+            # 2. Tạo đối tượng email
+            msg = Message(
+                subject=f"Báo cáo điểm danh ngày {datetime.datetime.now().strftime('%d-%m-%Y')}",
+                # Lấy email người gửi từ config
+                sender=('Hệ thống Điểm danh', current_app.config['MAIL_USERNAME']), 
+                # Điền email của người nhận vào đây (có thể là một danh sách)
+                recipients=['quochuyhuy38@gmail.com'], 
+                html=html_body
+            )
+
+            # 3. Gửi mail
+            mail.send(msg)
+            print("LOG: Đã gửi mail báo cáo thành công!")
+
+        except Exception as e:
+            # In ra lỗi nếu không gửi được mail, nhưng không làm sập server
+            print(f"ERROR: Không thể gửi mail - {e}")
+        # ==================================
+            
         return jsonify({
             "message": "Đã kết thúc và chốt danh sách phiên điểm danh.",
             "report": final_report
@@ -54,14 +204,20 @@ def stop_session():
         if conn and conn.is_connected():
             conn.close()
 
+
+
+# Giữ nguyên các route này
+@api.route('/')
+def home():
+    return "<h1>API Server cho hệ thống điểm danh đang hoạt động!</h1>"
+    
 @api.route('/api/session/status', methods=['GET'])
 def get_session_status():
-    """Kiểm tra trạng thái phiên hiện tại."""
     return jsonify({"is_active": session_active})
 
 @api.route('/api/students', methods=['GET', 'POST'])
 def handle_students():
-    """Xử lý việc LẤY và THÊM sinh viên."""
+    # ... (code của bạn giữ nguyên)
     conn = None
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -91,9 +247,10 @@ def handle_students():
         if conn and conn.is_connected():
             conn.close()
 
+
 @api.route('/api/register', methods=['POST'])
 def register_device():
-    """Xử lý việc đăng ký MAC cho sinh viên."""
+    # ... (code của bạn giữ nguyên)
     if not session_active:
         return jsonify({"error": "Hiện không có phiên điểm danh nào đang mở."}), 403
     
@@ -138,32 +295,48 @@ def register_device():
         if conn and conn.is_connected():
             conn.close()
 
-@api.route('/api/attendance/live', methods=['GET'])
-def live_attendance():
-    """Quét mạng và trả về trạng thái điểm danh trực tiếp."""
-    if not session_active:
-        return jsonify([])
-
-    conn = None
-    active_mac_set = scan_network()
+# bao mat 
+@api.route('/api/teacher/register', methods=['POST'])
+def register_teacher():
+    data = request.get_json()
+    hashed_password = generate_password_hash(data['password'], method='pbkdf2:sha256')
+    
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor()
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT student_id, full_name, mac_address FROM Students")
-        students = cursor.fetchall()
-        
-        attendance_status_list = []
-        for student in students:
-            status = 'Vắng mặt'
-            if student['mac_address'] and student['mac_address'].upper() in active_mac_set:
-                status = 'Có mặt'
-            student['status'] = status
-            attendance_status_list.append(student)
-
-        return jsonify(attendance_status_list)
+        cursor.execute("INSERT INTO Teachers (username, password_hash) VALUES (%s, %s)", (data['username'], hashed_password))
+        conn.commit()
+        return jsonify({'message': 'Tạo tài khoản giáo viên thành công!'})
     except mysql.connector.Error as err:
-        return jsonify({"error": str(err)}), 500
+        return jsonify({'error': f'Tên đăng nhập đã tồn tại: {err}'}), 409
     finally:
-        if conn and conn.is_connected():
-            cursor.close()
-            conn.close()
+        cursor.close()
+        conn.close()
+
+# == API ĐĂNG NHẬP CHO GIÁO VIÊN ==
+@api.route('/api/teacher/login', methods=['POST'])
+def login_teacher():
+    auth = request.get_json()
+    if not auth or not auth.get('username') or not auth.get('password'):
+        return jsonify({'message': 'Không thể xác thực'}), 401
+
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM Teachers WHERE username = %s", (auth['username'],))
+    teacher = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not teacher:
+        return jsonify({'message': 'Không tìm thấy người dùng'}), 401
+
+    if check_password_hash(teacher['password_hash'], auth['password']):
+        # Mật khẩu đúng, tạo token JWT
+        token = jwt.encode({
+            'user_id': teacher['id'],
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24) # Token hết hạn sau 24 giờ
+        }, current_app.config['SECRET_KEY'], algorithm="HS256")
+        
+        return jsonify({'token': token})
+
+    return jsonify({'message': 'Sai mật khẩu!'}), 403
