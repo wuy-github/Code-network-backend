@@ -1,4 +1,8 @@
+Ở trong nhớ tạo database mới chạy được
 Flask: Dùng để tạo web server, web socket
 getmac: Dùng để lấy địa chỉ MAC (cần cho phương án chạy file script).
 requests: Dùng để gửi dữ liệu từ client lên server (cần cho phương án chạy file script).
 Chạy môi trường venv\Scripts\activate
+Sau khi ở đâu dòng có chứ venv
+Chạy lệnh: pip install requirements.txt
+Chay lệnh: python app.py là xong 
