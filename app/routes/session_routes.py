@@ -2,7 +2,6 @@
 
 from flask import Blueprint, jsonify, current_app
 import datetime
-
 from .. import models, socketio, mail
 from ..utils import scan_network
 from .auth_routes import token_required
@@ -10,17 +9,28 @@ from flask_mail import Message
 
 session_bp = Blueprint('session_bp', __name__)
 
-# Các biến toàn cục để quản lý trạng thái phiên giờ sẽ nằm ở đây
-session_active = False
-background_task_started = False
-
-# --- LOGIC WEBSOCKET VÀ TÁC VỤ NỀN ---
+# --- LOGIC WEBSOCKET VÀ TÁC VỤ NỀN (ĐÃ SỬA) ---
 
 def attendance_background_task():
     """Tác vụ nền quét mạng và phát sự kiện điểm danh."""
     print("LOG: Bắt đầu tác vụ quét mạng chạy nền...")
-    while session_active:
+    
+    is_active = True
+    while is_active:
         try:
+            # === KIỂM TRA TRẠNG THÁI TRONG VÒNG LẶP ===
+            conn_check = models.get_db_connection()
+            cursor_check = conn_check.cursor(dictionary=True)
+            cursor_check.execute("SELECT state_value FROM AppState WHERE state_key = 'session_active'")
+            result = cursor_check.fetchone()
+            conn_check.close()
+            
+            # Nếu state trong DB là 'false', dừng vòng lặp
+            if result['state_value'] != 'true':
+                is_active = False
+                continue # Bỏ qua lần quét cuối và thoát
+
+            # === LOGIC QUÉT MẠNG GIỮ NGUYÊN ===
             active_mac_set = scan_network()
             students = models.get_all_students()
             
@@ -36,46 +46,44 @@ def attendance_background_task():
 
         except Exception as e:
             print(f"ERROR: Lỗi trong tác vụ nền: {e}")
+            is_active = False # Dừng tác vụ nếu có lỗi
         
-        socketio.sleep(5)
+        socketio.sleep(5) # Quét mỗi 5 giây
+        
     print("LOG: Đã dừng tác vụ quét mạng chạy nền.")
 
-@socketio.on('connect')
-def handle_connect():
-    """Xử lý khi một client mới kết nối WebSocket."""
-    print('LOG: Một client vừa kết nối tới WebSocket.')
-
-# --- CÁC ROUTE QUẢN LÝ PHIÊN ---
+# --- CÁC ROUTE QUẢN LÝ PHIÊN (ĐÃ SỬA) ---
 
 @session_bp.route('/session/start', methods=['POST'])
 @token_required
 def start_session():
-    """Bắt đầu một phiên điểm danh và khởi động tác vụ nền."""
-    global session_active, background_task_started
+    conn = models.get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE AppState SET state_value = 'true' WHERE state_key = 'session_active'")
+    conn.commit()
+    conn.close()
+
+    socketio.start_background_task(target=attendance_background_task)
     
-    if not session_active:
-        session_active = True
-        if not background_task_started:
-            socketio.start_background_task(target=attendance_background_task)
-            background_task_started = True
-        return jsonify({"message": "Đã bắt đầu phiên điểm danh và quét mạng."})
-    else:
-        return jsonify({"message": "Phiên đã hoạt động từ trước."})
+    return jsonify({"message": "Đã bắt đầu phiên điểm danh và quét mạng."})
 
 
 @session_bp.route('/session/stop', methods=['POST'])
 @token_required
 def stop_session():
-    """Kết thúc phiên, gửi mail báo cáo, và trả về kết quả."""
-    global session_active, background_task_started
-    if not session_active:
-        return jsonify({"error": "Không có phiên nào đang diễn ra."}), 400
-
-    session_active = False
-    background_task_started = False
+    # Chỉ cần cập nhật trạng thái trong DB, tác vụ nền sẽ tự dừng lại
+    conn = models.get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE AppState SET state_value = 'false' WHERE state_key = 'session_active'")
+    conn.commit()
+    conn.close()
+    
+    # Gửi tín hiệu cho client biết phiên đã kết thúc ngay lập tức
     socketio.emit('session_stopped')
     
+    # Tạo báo cáo cuối kỳ (giữ nguyên logic)
     final_report = []
+    # ... (toàn bộ code tạo báo cáo và gửi mail của bạn giữ nguyên ở đây)
     try:
         active_mac_set = scan_network()
         students = models.get_all_students()
@@ -104,7 +112,7 @@ def stop_session():
         msg = Message(
             subject=f"Báo cáo điểm danh ngày {datetime.datetime.now().strftime('%d-%m-%Y')}",
             sender=('Hệ thống Điểm danh', current_app.config['MAIL_USERNAME']),
-            recipients=['quochuyhuy38@gmail.com'], # <-- Thay email người nhận ở đây
+            recipients=['quochuyhuy38@gmail.com'],
             html=html_body
         )
         mail.send(msg)
@@ -117,7 +125,15 @@ def stop_session():
         "report": final_report
     })
 
+
 @session_bp.route('/session/status', methods=['GET'])
 def get_session_status():
-    """Kiểm tra trạng thái phiên hiện tại."""
-    return jsonify({"is_active": session_active})
+    """Kiểm tra trạng thái phiên hiện tại từ DB."""
+    conn = models.get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT state_value FROM AppState WHERE state_key = 'session_active'")
+    result = cursor.fetchone()
+    conn.close()
+    
+    is_active = result['state_value'] == 'true' if result else False
+    return jsonify({"is_active": is_active})

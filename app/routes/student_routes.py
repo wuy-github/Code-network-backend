@@ -3,7 +3,8 @@
 from flask import Blueprint, jsonify, request
 from .. import models
 from ..utils import get_mac_from_ip
-from .session_routes import session_active 
+
+# Dòng import session_active không còn cần thiết nữa nên đã được xóa
 
 student_bp = Blueprint('student_bp', __name__)
 
@@ -29,11 +30,26 @@ def handle_students():
         return jsonify(students)
 
 
+# === HÀM NÀY ĐÃ ĐƯỢC SỬA LẠI THỤT LỀ CHO ĐÚNG ===
 @student_bp.route('/register', methods=['POST'])
 def register_device():
     """Xử lý việc sinh viên đăng ký MAC của thiết bị."""
- 
-    if not session_active:
+    # Toàn bộ code bên trong hàm này phải được thụt vào một cấp
+    
+    # ĐỌC TRẠNG THÁI TỪ DATABASE
+    conn = models.get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT state_value FROM AppState WHERE state_key = 'session_active'")
+    result = cursor.fetchone()
+    conn.close()
+    
+    # Thêm kiểm tra để phòng trường hợp bảng AppState trống
+    if not result:
+        return jsonify({"error": "Lỗi cấu hình server: không tìm thấy trạng thái phiên."}), 500
+
+    is_active = result['state_value'] == 'true'
+
+    if not is_active:
         return jsonify({"error": "Hiện không có phiên điểm danh nào đang mở."}), 403
     
     data = request.get_json()
